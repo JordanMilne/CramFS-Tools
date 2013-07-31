@@ -1,0 +1,296 @@
+//--------------------------------------
+//--- 010 Editor v5.0beta1 Binary Template
+//
+// File: CramFS.bt
+// Author: Jordan Milne <jordan.milne-sw@saynotolinux.com>
+// Revision: v0.1 (WIP)
+// Purpose: Reverse engineering cramfs images
+//--------------------------------------
+
+//Documentation: https://www.kernel.org/doc/Documentation/filesystems/cramfs.txt
+//Rule of thumb: Most everything in CramFS is on 4 byte boundaries.
+
+RequiresVersion(4, 0);
+
+//Whether or not to kill the script when we hit signature abnormalities
+#define STRICT_ERRORS
+
+//FROM cramfs.h
+#define CRAMFS_FLAG_FSID_VERSION_2  0x00000001	/* fsid version #2 */
+#define CRAMFS_FLAG_SORTED_DIRS 0x00000002	/* sorted dirs */
+#define CRAMFS_FLAG_HOLES   0x00000100	/* support for holes */
+#define CRAMFS_FLAG_WRONG_SIGNATURE	 0x00000200	/* reserved */
+#define CRAMFS_FLAG_SHIFTED_ROOT_OFFSET 0x00000400
+
+#define CRAMFS_SUPPORTED_FLAGS	( 0x000000ff \
+				| CRAMFS_FLAG_HOLES \
+				| CRAMFS_FLAG_WRONG_SIGNATURE \
+				| CRAMFS_FLAG_SHIFTED_ROOT_OFFSET )
+
+#define CRAMFS_MODE_WIDTH 16
+#define CRAMFS_UID_WIDTH 16
+#define CRAMFS_SIZE_WIDTH 24
+#define CRAMFS_GID_WIDTH 8
+#define CRAMFS_NAMELEN_WIDTH 6
+#define CRAMFS_OFFSET_WIDTH 26
+
+#define CRAMFS_MAXPATHLEN (((1 << CRAMFS_NAMELEN_WIDTH) - 1) << 2)
+
+local char CRAMFS_SIG[] = "Compressed ROMFS";
+
+
+/////////////
+// Structs //
+/////////////
+
+typedef enum <uint> e_cramfs_file_type {
+    S_IFIFO = 1, //FIFO
+    S_IFCHR = 2,	//Char device
+    S_IFDIR = 4,	//Directory
+    S_IFBLK = 6,	//Block device
+    S_IFREG = 8,	//File
+    S_IFLNK = 10, //Symbolic Link
+    S_IFSOCK = 12 //Socket
+} ECramFSFileType;
+
+typedef struct {
+
+} CramFSFileMode;
+
+//According to the spec
+typedef struct {
+    if(CheckFSCRC(parentof(this), parentof(this).size))
+        SetBackColor(cLtGreen);
+    else
+        SetBackColor(cLtRed);
+
+    uint32 crc;
+    SetBackColor(cNone);
+    uint32 edition;
+    uint32 blocks;
+    uint32 files;
+} FSID;
+
+typedef struct {
+    if(IsLittleEndian())
+    {
+        uint mode : 12 <format=octal, comment="File mode (including SU/GID bit?)">;
+        ECramFSFileType type : 4;
+    }
+    else
+    {
+        ECramFSFileType type : 4;
+        uint mode : 12 <format=octal, comment="File mode (including SU/GID bit?)">;
+    }
+    uint uid : CRAMFS_UID_WIDTH <comment="User ID">;
+
+    //size means different things depending on what the entry is
+    if(type == S_IFBLK || type == S_IFCHR)
+        uint size : CRAMFS_SIZE_WIDTH <comment="i_rdev">;
+    else if(type == S_IFDIR)
+        uint size : CRAMFS_SIZE_WIDTH <comment="Sum of child inode sizes">;
+    else
+        uint size : CRAMFS_SIZE_WIDTH <comment="Size of the file">;
+
+    uint gid : CRAMFS_GID_WIDTH <comment="Group ID (may be truncated)">;
+    //namelen is rounded up to the nearest multiple of four divided by four
+    uint namelen : CRAMFS_NAMELEN_WIDTH <comment="Ceil(Length of the filename / 4)">; 
+    uint offset : CRAMFS_OFFSET_WIDTH <comment="Offset of the file or first directory entry / 4">;
+    
+} CramFSInode;
+
+typedef struct {
+    if(HandleMagicNumber())
+    {
+        SetBackColor(cLtRed);
+        ParseError("Incorrect magic number at start of file", FTell());
+    }
+    else
+    {
+        SetBackColor(cLtGreen);
+        if(IsLittleEndian())
+            uint32 MAGIC_NUMBER <comment="Little-endian image">;
+        else
+            uint32 MAGIC_NUMBER <comment="Big-endian image">;
+    }
+    SetBackColor(cNone);
+
+    uint32 size <comment="Size of filesystem in bytes">;
+    uint32 flags;
+    uint32 future <comment="Reserved for future use?">;
+
+    if(CheckImageSig(FTell()))
+    {
+        ParseError("Invalid signature", FTell());
+        SetBackColor(cLtRed);
+    }
+    else
+        SetBackColor(cLtGreen);
+    
+    char signature[16] <comment="Filesystem signature">;
+    SetBackColor(cNone);
+
+    //If this is a CramFS version 1 filesystem, this is just random data
+    if(flags & CRAMFS_FLAG_FSID_VERSION_2)
+        FSID fsid <comment="Filesystem metadata for CramFS v2">;
+    else
+        uchar fsid_placeholder <comment="Random data in CramFS v1">;
+
+    char name[16] <comment="Volume name">;
+    
+    CramFSInode root_inode;
+} CramFSSuperBlock;
+
+
+
+///////////////
+// Functions //
+///////////////
+
+void ParseError(string message, uint64 pos)
+{
+    SPrintf(message, "%s at 0x%x", message, pos);
+    Warning(message);
+    Printf("Warning: %s\n", message);
+#ifdef STRICT_ERRORS
+    Exit(1);
+#endif
+}
+
+
+//Given the superblock, verify the checksum for the filesystem
+int CheckFSCRC(CramFSSuperBlock &sb, uint32 size)
+{
+    local uint32 old_crc = ReadUInt(startof(sb.fsid));
+    local uint64 crc_field_pos = startof(sb.fsid);
+    local uint64 crc_field_end = crc_field_pos + 4;
+    local uint64 sb_start = startof(sb);
+    local uint64 len = crc_field_pos - sb_start;
+
+    local uint32 crc = (uint32)Checksum(CHECKSUM_CRC32, sb_start, len);
+    //append crc for 4 null bytes (mimicking an empty crc field)
+    crc = crc32_combine(crc, 558161692U, 4);
+
+    //read everything after the crc field 
+    len = size - crc_field_end;
+    crc = crc32_combine(crc, (uint32)Checksum(CHECKSUM_CRC32, crc_field_end, len), len);
+
+    return crc == old_crc;
+}
+
+int HandleMagicNumber()
+{
+    local uint32 magic_number = ReadUInt(0);
+
+    //little endian
+    if(magic_number == 684539205)
+    {
+        LittleEndian();
+        return 0;
+    }
+    //big endian
+    if(magic_number == 1161678120)
+    {
+        BigEndian();
+        return 0;
+    }
+    //not a cramfs image???
+    return 1;
+}
+
+//returns 0 for correct signature, anything else is failure
+int CheckImageSig(uint64 pos)
+{
+    local int sig_len = Strlen(CRAMFS_SIG);
+    local char found_bytes[sig_len];
+    ReadBytes(found_bytes, pos, sig_len);
+    return (Memcmp(CRAMFS_SIG, found_bytes, sig_len));
+}
+
+
+/********
+IMPORTED FROM ZLIB FOR CRC COMBINATION
+********/
+
+#define GF2_DIM 32      /* dimension of GF(2) vectors (length of CRC) */
+typedef uint32 mat_table[GF2_DIM];
+unsigned long gf2_matrix_times(mat_table mat, uint32 vec)
+{
+    local unsigned long sum = 0;
+    local int i = 0;
+    while (vec) {
+        if (vec & 1)
+            sum ^= mat[i];
+        vec >>= 1;
+        ++i;
+    }
+    return sum;
+}
+
+void gf2_matrix_square(mat_table& square, mat_table& mat)
+{
+    local int n;
+
+    for (n = 0; n < GF2_DIM; n++)
+        square[n] = gf2_matrix_times(mat, mat[n]);
+}
+
+uint32 crc32_combine(uint32 crc1, uint32 crc2, uint64 len2)
+{
+    local int n;
+    local uint32 row;
+    local mat_table even; /* even-power-of-two zeros operator */
+    local mat_table odd; /* odd-power-of-two zeros operator */
+
+    /* degenerate case (also disallow negative lengths) */
+    if (len2 <= 0)
+        return crc1;
+
+    /* put operator for one zero bit in odd */
+    odd[0] = 0xedb88320UL; /* CRC-32 polynomial */
+    row = 1;
+    for (n = 1; n < GF2_DIM; n++) {
+        odd[n] = row;
+        row <<= 1;
+    }
+
+    /* put operator for two zero bits in even */
+    gf2_matrix_square(even, odd);
+
+    /* put operator for four zero bits in odd */
+    gf2_matrix_square(odd, even);
+
+    /* apply len2 zeros to crc1 (first square will put the operator for one
+zero byte, eight zero bits, in even) */
+    do {
+        /* apply zeros operator for this bit of len2 */
+        gf2_matrix_square(even, odd);
+        if (len2 & 1)
+            crc1 = gf2_matrix_times(even, crc1);
+        len2 >>= 1;
+
+        /* if no more bits set, then done */
+        if (len2 == 0)
+            break;
+
+        /* another iteration of the loop with odd and even swapped */
+        gf2_matrix_square(odd, even);
+        if (len2 & 1)
+            crc1 = gf2_matrix_times(odd, crc1);
+        len2 >>= 1;
+
+        /* if no more bits set, then done */
+    } while (len2 != 0);
+
+    /* return combined crc */
+    crc1 ^= crc2;
+    return crc1;
+}
+
+/********
+END ZLIB IMPORTS
+********/
+
+
+
+CramFSSuperBlock superblock;
