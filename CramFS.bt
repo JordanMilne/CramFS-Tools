@@ -3,7 +3,7 @@
 //
 // File: CramFS.bt
 // Author: Jordan Milne <jordan.milne-sw@saynotolinux.com>
-// Revision: v0.1 (WIP)
+// Revision: v0.2 (WIP)
 // Purpose: Reverse engineering cramfs images
 //--------------------------------------
 
@@ -14,6 +14,9 @@ RequiresVersion(4, 0);
 
 //Whether or not to kill the script when we hit signature abnormalities
 #define STRICT_ERRORS
+
+//Change for shifted root
+#define ROOT_OFFSET 0
 
 //FROM cramfs.h
 #define CRAMFS_FLAG_FSID_VERSION_2  0x00000001	/* fsid version #2 */
@@ -72,6 +75,9 @@ typedef struct {
 } FSID;
 
 typedef struct {
+
+    // This doesn't match up with the kernel headers but is necessary for variable endianness
+    // <hack>
     if(IsLittleEndian())
     {
         uint mode : 12 <format=octal, comment="File mode (including SU/GID bit?)">;
@@ -82,6 +88,7 @@ typedef struct {
         ECramFSFileType type : 4;
         uint mode : 12 <format=octal, comment="File mode (including SU/GID bit?)">;
     }
+    //</hack>
     uint uid : CRAMFS_UID_WIDTH <comment="User ID">;
 
     //size means different things depending on what the entry is
@@ -97,7 +104,7 @@ typedef struct {
     uint namelen : CRAMFS_NAMELEN_WIDTH <comment="Ceil(Length of the filename / 4)">; 
     uint offset : CRAMFS_OFFSET_WIDTH <comment="Offset of the file or first directory entry / 4">;
     
-} CramFSInode;
+} CramFSInode <size=12>;
 
 typedef struct {
     if(HandleMagicNumber())
@@ -137,8 +144,6 @@ typedef struct {
         uchar fsid_placeholder <comment="Random data in CramFS v1">;
 
     char name[16] <comment="Volume name">;
-    
-    CramFSInode root_inode;
 } CramFSSuperBlock;
 
 
@@ -291,6 +296,39 @@ zero byte, eight zero bits, in even) */
 END ZLIB IMPORTS
 ********/
 
+//some people generate invalid dir entries for . and ..
+//and mess up parsing. ignore them.
+int ValidDirName(string name)
+{
+    return (name != "." && name != "..");
+}
 
+void Recurse(int64 pos, int64 size);
 
+//Try to create entries for the subdirectory's children (if it's a directory and it has children)
+void TryRecurse(CramFSInode& obj)
+{
+    //don't recurse down self-referential or invalid directories
+    if(obj.type == S_IFDIR && obj.offset != 0 && obj.size != 0)
+        Recurse(obj.offset << 2, obj.size );
+}
+
+void Recurse(int64 pos, int64 size)
+{
+    local int64 end = pos + size;
+    while(pos < end)
+    {
+
+        FSeek(pos);
+        CramFSInode inode;    
+
+        pos += sizeof(CramFSInode) + (inode.namelen << 2);
+
+        TryRecurse(inode);
+    }
+}
+
+FSeek(ROOT_OFFSET);
 CramFSSuperBlock superblock;
+
+Recurse(FTell(), 1);
